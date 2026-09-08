@@ -5,7 +5,7 @@
 import http from 'node:http';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -113,16 +113,45 @@ async function orchestrate(payload) {
 
   const lowerContent = userContent.toLowerCase();
 
-  // 1. Read file (English + Thai)
+  // 1. Read file (English + Thai, with or without path prefix)
   const readMatch = /(?:read|open|show|view|display|get|cat|อ่าน(?:ไฟล์)?|เปิด|แสดง)\s+(?:file\s+|path\s+|ไฟล์\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
   const showPathMatch = /(?:show|tell|give|บอก|ให้)\s+(?:me\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
   const thaiReadMatch = /(?:อ่าน|เปิด|แสดง)\s+(?:ไฟล์|เนื้อหา|ข้อมูล)?\s*["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+  const bareFileMatch = /(?:read|open|show|view|display|อ่าน|เปิด|แสดง)\s+(?:file\s+)?["']?([a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+)["']?/i.exec(userContent);
   const fileRequest = readMatch || showPathMatch || thaiReadMatch;
+  const bareFile = bareFileMatch?.[1];
 
-  if (fileRequest || /(?:read|open|show|อ่าน|เปิด|แสดง)\s+\/(?:tmp|home|Users|etc|var|usr)/i.test(userContent)) {
+  if (fileRequest || bareFile || /(?:read|open|show|อ่าน|เปิด|แสดง)\s+\/(?:tmp|home|Users|etc|var|usr)/i.test(userContent)) {
     const singlePath = fileRequest?.[1];
     const allPaths = extractFilePaths(userContent);
     if (singlePath && !allPaths.includes(singlePath)) allPaths.unshift(singlePath);
+    if (bareFile) {
+      const candidates = [];
+      // Prefer files closer to the project root (home/Projects/project/)
+      const commonRoots = [
+        resolve(homedir(), 'Project', 'aipass-dev-suite'),
+        resolve(homedir(), 'Projects', 'aipass-dev-suite'),
+      ];
+      for (const root of commonRoots) {
+        candidates.push(resolve(root, bareFile));
+      }
+      // Then search upward from cwd
+      let dir = process.cwd();
+      const root = homedir();
+      while (dir.startsWith(root) || dir.startsWith('/Users')) {
+        candidates.push(resolve(dir, bareFile));
+        if (dir === root || dir === '/') break;
+        dir = dirname(dir);
+      }
+      // Check which candidate exists
+      for (const candidate of candidates) {
+        const result = await readLocalFile(candidate);
+        if (result.ok) {
+          allPaths.unshift(candidate);
+          break;
+        }
+      }
+    }
     let response = '';
     for (const fp of allPaths) {
       const result = await readLocalFile(fp);
@@ -159,16 +188,27 @@ async function orchestrate(payload) {
     return { content: `❌ Command failed: ${result.error}`, stream };
   }
 
-  // 5. File write → return info for aipass to handle
-  if (/^(?:write|edit|create|แก้ไข|เขียน|สร้าง)\s+/i.test(lowerContent)) {
-    const fileMatch = /["']?(\/[^"'\s]+)["']?/i.exec(userContent);
-    const filePath = fileMatch?.[1];
-    if (filePath) {
-      let existingContent = '';
-      try { const r = await readLocalFile(filePath); if (r.ok) existingContent = r.content; } catch { /* new */ }
-      return { content: `📝 **File Write Request:** ${filePath}\n\nCurrent content:\n\`\`\`\n${existingContent || '(new file)'}\n\`\`\`\n\nFile operations are handled by the orchestrator. For complex edits, please paste the new content directly.`, stream };
+  // 5. File write/edit/create → handle directly
+    if (/^(?:write|edit|create|แก้ไข|เขียน|สร้าง)\s+/i.test(lowerContent)) {
+      const fileMatch = /["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+      const filePath = fileMatch?.[1];
+      if (filePath) {
+        // Extract content from user request
+        let newContent = '';
+        const contentMatch = userContent.match(/(?:with content|content|เนื้อหา|content:|เนื้อหา:)[:\s]+(.+)$/i);
+        if (contentMatch) newContent = contentMatch[1].trim();
+      
+        if (newContent) {
+          await writeFile(filePath, newContent);
+          return { content: `✅ Written to ${filePath}`, stream };
+        }
+      
+        // No content provided — show current and ask
+        let existingContent = '';
+        try { const r = await readLocalFile(filePath); if (r.ok) existingContent = r.content; } catch { /* new file */ }
+        return { content: `📝 **File Write Request:** ${filePath}\n\nCurrent content:\n\`\`\`\n${existingContent || '(new file)'}\n\`\`\`\n\nPlease specify content: "write [path] with content: [your content]"`, stream };
+      }
     }
-  }
 
   // 6. Default: Bridge (Claude) → fallback to Nous for general chat only
   try {

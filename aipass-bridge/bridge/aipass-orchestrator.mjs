@@ -1,90 +1,59 @@
 #!/usr/bin/env node
-// aipass-orchestrator.mjs — UNIFIED Provider
-// Inversion approach: Don't inject text into Claude — return files directly
+// aipass-orchestrator.mjs — aipass (Claude Sonnet 5) as Orchestrator/Adapter
+// File ops handled directly; Claude only for general chat
 
 import http from 'node:http';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
-
-const require = createRequire(import.meta.url);
 
 const PORT = Number(process.env.PORT ?? 8788);
 const BRIDGE = process.env.BRIDGE ?? 'http://127.0.0.1:8787';
+const NOUS_API = 'https://inference-api.nousresearch.com/v1';
+
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), '[aipass]', ...a);
 
-function readNousToken() {
+// ── Helpers ───────────────────────────────────────────────────────
+
+function readToken() {
   try {
     const auth = JSON.parse(readFileSync(resolve(homedir(), '.hermes', 'auth.json'), 'utf8'));
     return auth?.providers?.nous?.access_token ?? '';
   } catch { return ''; }
 }
 
-async function readLocalFile(path) {
+async function readLocalFile(p) {
+  try { return { ok: true, content: await readFile(p, 'utf8') }; }
+  catch (e) { return { ok: false, error: e.message }; }
+}
+
+async function listDir(p) {
+  try { return { ok: true, entries: await readdir(p) }; }
+  catch (e) { return { ok: false, error: e.message }; }
+}
+
+async function searchFiles(pattern, dir, glob) {
   try {
-    const content = await readFile(path, 'utf8');
-    return { ok: true, content };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
+    const out = execSync(`grep -r "${pattern}" ${dir} --include="${glob}" -l || true`, { encoding: 'utf8', timeout: 15000 });
+    return { ok: true, files: out.split('\n').filter(Boolean) };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
-async function listLocalDir(path) {
-  try {
-    const entries = await readdir(path || '.');
-    return { ok: true, entries };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
+async function runCmd(cmd, cwd) {
+  try { return { ok: true, output: execSync(cmd, { encoding: 'utf8', timeout: 30000, cwd: cwd || process.cwd() }) }; }
+  catch (e) { return { ok: false, error: e.message }; }
 }
-
-async function searchLocalFiles(pattern, path, glob) {
-  try {
-    const cmd = `grep -r "${pattern}" ${path || '.'} --include="${glob || '*'}" -l || true`;
-    const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 });
-    return { ok: true, files: output.split('\n').filter(Boolean) };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-}
-
-async function runLocalCommand(command, cwd) {
-  try {
-    const output = execSync(command, { encoding: 'utf8', timeout: 30000, cwd: cwd || process.cwd() });
-    return { ok: true, output };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-}
-
-// ── Call aipass (no injection — pure) ────────────────────────────────
-
-async function callAipass(messages) {
-  const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'claude-sonnet-5@default', stream: false, messages }),
-  });
-  if (!res.ok) throw new Error(`bridge ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? '';
-}
-
-// ── Extract file paths ───────────────────────────────────────────────
 
 function extractFilePaths(text) {
   const paths = [];
   const patterns = [
     /["'](\/[^"']+)["']/g,
     /["']([^"']+\.(?:js|ts|json|mjs|cjs|py|sh|md|txt|yaml|yml|toml|html|css|jsx|tsx|png|jpg))["']/gi,
-    /file\s+["']?([^"'\s]+)["']?/gi,
-    /path\s+["']?([^"'\s]+)["']?/gi,
-    /read\s+["']?([^"'\s]+)["']?/gi,
-    /(\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+(?:\.[a-zA-Z]+)?)/g,
+    /(?:file|path|read|ไฟล์|อ่าน)\s+["']?([^"'\s]+)["']?/gi,
+    /(\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+)/g,
   ];
   for (const re of patterns) {
     let m;
@@ -96,7 +65,41 @@ function extractFilePaths(text) {
   return paths;
 }
 
-// ── Main Orchestration (Inversion Approach) ─────────────────────────
+// ── External Calls ────────────────────────────────────────────────
+
+async function callBridge(model, messages) {
+  const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model, stream: false, messages }),
+  });
+  if (!res.ok) throw new Error(`bridge ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? '';
+}
+
+async function callNous(model, prompt, system = 'You are a helpful AI assistant.') {
+  const token = readToken();
+  if (!token) throw new Error('No Nous token');
+  const https = await import('node:https');
+  const url = new URL(`${NOUS_API}/chat/completions`);
+  const body = JSON.stringify({ model, stream: false, max_tokens: 2048, messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }] });
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname: url.hostname, port: 443, path: url.pathname, method: 'POST', headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}`, 'user-agent': 'Hermes', 'content-length': Buffer.byteLength(body) } }, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        if (res.statusCode >= 400) reject(new Error(`Nous ${res.statusCode}: ${data.slice(0, 200)}`));
+        else try { resolve(JSON.parse(data).choices?.[0]?.message?.content ?? ''); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Orchestrator ──────────────────────────────────────────────────
 
 async function orchestrate(payload) {
   const stream = payload.stream !== false;
@@ -110,79 +113,100 @@ async function orchestrate(payload) {
 
   const lowerContent = userContent.toLowerCase();
 
-  // ── INVERSION: Detect files FIRST, handle directly, skip Claude ──
+  // 1. Read file (English + Thai)
+  const readMatch = /(?:read|open|show|view|display|get|cat|อ่าน(?:ไฟล์)?|เปิด|แสดง)\s+(?:file\s+|path\s+|ไฟล์\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+  const showPathMatch = /(?:show|tell|give|บอก|ให้)\s+(?:me\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+  const thaiReadMatch = /(?:อ่าน|เปิด|แสดง)\s+(?:ไฟล์|เนื้อหา|ข้อมูล)?\s*["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+  const fileRequest = readMatch || showPathMatch || thaiReadMatch;
 
-  // 1. Read file request (supports multiple files)
-  const readMatch = /(?:read|open|show|view|display|get|cat)\s+(?:file\s+|path\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
-  const showPathMatch = /(?:show|tell|give)\s+(?:me\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
-  const fileRequest = readMatch || showPathMatch;
-  if (fileRequest || /(?:read|open|show)\s+\/(?:tmp|home|Users|etc|var|usr)/i.test(userContent)) {
-    const allPaths = extractFilePaths(userContent);
+  if (fileRequest || /(?:read|open|show|อ่าน|เปิด|แสดง)\s+\/(?:tmp|home|Users|etc|var|usr)/i.test(userContent)) {
     const singlePath = fileRequest?.[1];
+    const allPaths = extractFilePaths(userContent);
     if (singlePath && !allPaths.includes(singlePath)) allPaths.unshift(singlePath);
     let response = '';
-    for (const filePath of allPaths) {
-      const result = await readLocalFile(filePath);
-      if (result.ok) {
-        response += `📄 **${filePath}:**\n\n\`\`\`\n${result.content}\n\`\`\`\n\n`;
-      } else {
-        response += `❌ **${filePath}:** ${result.error}\n\n`;
-      }
+    for (const fp of allPaths) {
+      const result = await readLocalFile(fp);
+      response += result.ok
+        ? `📄 **${fp}:**\n\n\`\`\`\n${result.content}\n\`\`\`\n\n`
+        : `❌ **${fp}:** ${result.error}\n\n`;
     }
-    if (response) {
-      return { content: response.trim(), stream };
-    }
+    if (response) return { content: response.trim(), stream };
   }
 
-  // 2. List directory request
-  const listMatch = /(?:list|show|what(?:'s| is)\s+in)\s+(?:files?\s+in\s+)?["']?(\/[^"'\s]+)["']?/i.exec(userContent);
-  if (listMatch || /list\s+(?:files|directory|folder|dir)/i.test(lowerContent)) {
-    const dirPath = listMatch?.[1] || extractFilePaths(userContent)[0] || '/tmp';
-    const result = await listLocalDir(dirPath);
-    if (result.ok) {
-      return { content: `📂 **${dirPath}/** (${result.entries.length} items):\n\n${result.entries.join('\n')}`, stream };
-    }
-    return { content: `❌ Directory not found: ${dirPath}\n\nError: ${result.error}`, stream };
+  // 2. List directory
+  if (/(?:list|show|what(?:'s| is)\s+in|แสดงรายการ)\s+(?:files?\s+in\s+)?["']?(\/[^"'\s]+)["']?/i.test(userContent) || /list\s+(?:files|directory|folder|dir|ไฟล์|โฟลเดอร์)/i.test(lowerContent)) {
+    const dirMatch = /["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+    const dirPath = dirMatch?.[1] || '/tmp';
+    const result = await listDir(dirPath);
+    if (result.ok) return { content: `📂 **${dirPath}/** (${result.entries.length} items):\n\n${result.entries.join('\n')}`, stream };
+    return { content: `❌ Directory not found: ${dirPath}\n${result.error}`, stream };
   }
 
-  // 3. Search request
-  const searchMatch = /(?:search|find|grep|look\s+for)\s+["']?([^"']+?)["']?\s+(?:in|inside|within)\s+(\S+)/i.exec(userContent);
-  if (searchMatch || /(?:search|find|grep)\s+for/i.test(lowerContent)) {
+  // 3. Search files
+  if (/(?:search|find|grep|look\s+for|ค้นหา)\s+["']?([^"']+?)["']?\s+(?:in|inside|within|ใน)\s+(\S+)/i.test(userContent) || /(?:search|find|grep|ค้นหา)\s+for/i.test(lowerContent)) {
+    const searchMatch = /(?:search|find|grep|ค้นหา)\s+["']?([^"']+?)["']?\s+(?:in|inside|within|ใน)\s+(\S+)/i.exec(userContent);
     const pattern = searchMatch?.[1] || '';
     const dirPath = searchMatch?.[2] || '.';
-    const result = await searchLocalFiles(pattern, dirPath, '*');
-    if (result.ok) {
-      return { content: `🔍 **Search "${pattern}" in ${dirPath}:**\n\n${result.files.join('\n') || 'No matches found'}`, stream };
-    }
+    const result = await searchFiles(pattern, dirPath, '*');
+    if (result.ok) return { content: `🔍 **Search "${pattern}" in ${dirPath}:**\n\n${result.files.join('\n') || 'No matches found'}`, stream };
   }
 
   // 4. Run command
-  if (/^(?:run|execute|cmd|command|shell|bash)\s+/i.test(lowerContent)) {
-    const cmd = userContent.replace(/^(?:run|execute|cmd|command|shell|bash)\s+/i, '').trim();
-    const result = await runLocalCommand(cmd);
-    if (result.ok) {
-      return { content: `💻 **Command:** \`${cmd}\`\n\n\`\`\`\n${result.output}\n\`\`\``, stream };
-    }
+  if (/^(?:run|execute|cmd|command|shell|bash|รัน)\s+/i.test(lowerContent)) {
+    const cmd = userContent.replace(/^(?:run|execute|cmd|command|shell|bash|รัน)\s+/i, '').trim();
+    const result = await runCmd(cmd);
+    if (result.ok) return { content: `💻 **Command:** \`${cmd}\`\n\n\`\`\`\n${result.output}\n\`\`\``, stream };
     return { content: `❌ Command failed: ${result.error}`, stream };
   }
 
-  // 5. Default: Pass to Claude
+  // 5. File write → return info for aipass to handle
+  if (/^(?:write|edit|create|แก้ไข|เขียน|สร้าง)\s+/i.test(lowerContent)) {
+    const fileMatch = /["']?(\/[^"'\s]+)["']?/i.exec(userContent);
+    const filePath = fileMatch?.[1];
+    if (filePath) {
+      let existingContent = '';
+      try { const r = await readLocalFile(filePath); if (r.ok) existingContent = r.content; } catch { /* new */ }
+      return { content: `📝 **File Write Request:** ${filePath}\n\nCurrent content:\n\`\`\`\n${existingContent || '(new file)'}\n\`\`\`\n\nFile operations are handled by the orchestrator. For complex edits, please paste the new content directly.`, stream };
+    }
+  }
+
+  // 6. Default: Bridge (Claude) → fallback to Nous for general chat only
   try {
-    const reply = await callAipass([
+    const reply = await callBridge('claude-sonnet-5@default', [
       { role: 'system', content: 'You are a helpful AI assistant. Provide clear and concise answers.' },
       { role: 'user', content: userContent },
     ]);
     return { content: reply, stream };
   } catch (err) {
-    return { content: `aipass unavailable: ${err.message}`, stream };
+    log(`Bridge unavailable, fallback to Nous for general chat: ${err.message.slice(0, 80)}`);
+    try {
+      const result = await callNous('meituan/longcat-2.0:free', userContent);
+      return { content: result, stream };
+    } catch (nousErr) {
+      return { content: `All providers unavailable: ${err.message.slice(0, 100)}`, stream };
+    }
   }
 }
 
-// ── HTTP Server ─────────────────────────────────────────────────────
+// ── HTTP Server ───────────────────────────────────────────────────
+
+function json(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+function readBody(req, limit = 32 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const parts = [];
+    req.on('data', (c) => { size += c.length; if (size > limit) { reject(new Error('body too large')); req.destroy(); return; } parts.push(c); });
+    req.on('end', () => resolve(Buffer.concat(parts).toString('utf8')));
+    req.on('error', reject);
+  });
+}
 
 const server = http.createServer(async (req, res) => {
   const urlPath = new URL(req.url, `http://${req.headers.host}`).pathname.replace(/\/+$/, '') || '/';
-
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
   res.setHeader('access-control-allow-headers', '*');
@@ -225,34 +249,21 @@ const server = http.createServer(async (req, res) => {
         res.write('data: [DONE]\n\n');
         res.end();
       } else {
-        return json(res, 200, { id, object: 'chat.completion', created, model,
-          choices: [{ index: 0, message: { role: 'assistant', content: result.content }, finish_reason: 'stop' }] });
+        return json(res, 200, { id, object: 'chat.completion', created, model, choices: [{ index: 0, message: { role: 'assistant', content: result.content }, finish_reason: 'stop' }] });
       }
     } catch (err) {
+      log(`Error: ${err.message}`);
       return json(res, 500, { error: { message: err.message } });
     }
     return;
   }
 
-  return json(res, 404, { error: { message: 'not found' } });
+  return json(res, 404, { error: { message: `no route for ${req.method} ${urlPath}` } });
 });
-
-function json(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
-}
-
-function readBody(req, limit = 32 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0; const parts = [];
-    req.on('data', (c) => { size += c.length; if (size > limit) { reject(new Error('body too large')); return; } parts.push(c); });
-    req.on('end', () => resolve(Buffer.concat(parts).toString('utf8')));
-    req.on('error', reject);
-  });
-}
 
 server.listen(PORT, '127.0.0.1', () => {
-  log(`aipass-orchestrator (inversion approach) on :${PORT}`);
+  log(`aipass-orchestrator (inversion) on :${PORT}`);
   log('Ready...');
 });
+
+export { orchestrate, extractFilePaths, readLocalFile, listDir, searchFiles, runCmd };

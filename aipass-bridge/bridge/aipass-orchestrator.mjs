@@ -123,7 +123,7 @@ async function orchestrate(payload) {
 
   if (fileRequest || bareFile || /(?:read|open|show|อ่าน|เปิด|แสดง)\s+\/(?:tmp|home|Users|etc|var|usr)/i.test(userContent)) {
     const singlePath = fileRequest?.[1];
-    const allPaths = extractFilePaths(userContent);
+    let allPaths = extractFilePaths(userContent);
     if (singlePath && !allPaths.includes(singlePath)) allPaths.unshift(singlePath);
     if (bareFile) {
       const candidates = [];
@@ -143,14 +143,17 @@ async function orchestrate(payload) {
         if (dir === root || dir === '/') break;
         dir = dirname(dir);
       }
-      // Check which candidate exists
+      // Check which candidate exists - only add the FIRST match (project root)
       for (const candidate of candidates) {
         const result = await readLocalFile(candidate);
         if (result.ok) {
           allPaths.unshift(candidate);
-          break;
+          break; // Stop at first match (project root)
         }
       }
+      // After finding the bare file, DON'T add other matches from extractFilePaths
+      // Clear any other matches that might have been added by extractFilePaths
+      allPaths = allPaths.slice(0, 1);
     }
     let response = '';
     for (const fp of allPaths) {
@@ -180,12 +183,28 @@ async function orchestrate(payload) {
     if (result.ok) return { content: `🔍 **Search "${pattern}" in ${dirPath}:**\n\n${result.files.join('\n') || 'No matches found'}`, stream };
   }
 
-  // 4. Run command
+  // 4. Run command (supports cd, grep, find, etc.)
   if (/^(?:run|execute|cmd|command|shell|bash|รัน)\s+/i.test(lowerContent)) {
     const cmd = userContent.replace(/^(?:run|execute|cmd|command|shell|bash|รัน)\s+/i, '').trim();
     const result = await runCmd(cmd);
     if (result.ok) return { content: `💻 **Command:** \`${cmd}\`\n\n\`\`\`\n${result.output}\n\`\`\``, stream };
     return { content: `❌ Command failed: ${result.error}`, stream };
+  }
+
+  // 4b. Quick grep/search in files
+  if (/^(?:grep|search|find|ค้นหา)\s+/i.test(lowerContent)) {
+    let pattern = '';
+    let dir = '.';
+    const grepMatch = userContent.match(/(?:grep|search|find|ค้นหา)\s+["']?([^"']+)["']?(?:\s+in\s+["']?([^"']+)["']?)?/i);
+    if (grepMatch) {
+      pattern = grepMatch[1];
+      if (grepMatch[2]) dir = grepMatch[2];
+    }
+    if (pattern) {
+      const result = await searchFiles(pattern, dir, '*');
+      if (result.ok) return { content: `🔍 **grep "${pattern}" in ${dir}:**\n\n${result.files.join('\n') || 'No matches found'}`, stream };
+    }
+    return { content: `❌ Please specify pattern: grep "pattern" in [dir]`, stream };
   }
 
   // 5. File write/edit/create → handle directly

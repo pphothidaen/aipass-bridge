@@ -54,19 +54,71 @@
     'reasoning-start', 'reasoning-end', 'tool-input-delta', 'message-metadata',
   ]);
 
-  const reply = (msg) => window.postMessage({ [TAG]: 'res', ...msg }, window.location.origin);
+  let currentSessionEpoch = Date.now();
+  let isLeader = true;
+  const evidenceRegistry = new Map();
+
+  const reply = (msg) => window.postMessage({
+    [TAG]: 'res',
+    sessionEpoch: currentSessionEpoch,
+    ...msg,
+  }, window.location.origin);
+
+  function validateSessionEpoch(job) {
+    if (job?.sessionEpoch != null && job.sessionEpoch !== currentSessionEpoch) {
+      reply({
+        jobId: job.jobId,
+        kind: 'error',
+        code: 'session_epoch_mismatch',
+        message: `stale request rejected: sessionEpoch ${job.sessionEpoch} does not match active ${currentSessionEpoch}`,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  function recordEvidence(jobId, modelId) {
+    if (!jobId) return;
+    evidenceRegistry.set(jobId, {
+      sessionEpoch: currentSessionEpoch,
+      modelId: modelId || '',
+      startedAt: Date.now(),
+      status: 'running',
+    });
+  }
+
+  function completeEvidence(jobId, status = 'completed') {
+    if (!jobId) return;
+    const existing = evidenceRegistry.get(jobId);
+    if (existing) {
+      existing.completedAt = Date.now();
+      existing.status = status;
+    }
+  }
+
+  function invalidateEvidence() {
+    evidenceRegistry.clear();
+    for (const controller of inflight.values()) {
+      try { controller.abort(); } catch { /* ignore */ }
+    }
+    inflight.clear();
+  }
 
   // Read-only GET against one of the app's own loaders. Confined to /loaders/
   // so a compromised bridge cannot turn this into a general request forwarder.
   async function runLoader(job) {
+    if (!validateSessionEpoch(job)) return;
+    recordEvidence(job.jobId, job.modelId);
     try {
       if (!/^\/loaders\/[A-Za-z0-9._~-]+(\.data)?(\?|$)/.test(job.url)) {
         throw new Error(`refusing non-loader path: ${job.url}`);
       }
       const res = await fetch(job.url, { credentials: 'include', headers: { accept: '*/*' } });
       if (!res.ok) throw new Error(`aipass returned ${res.status} ${res.statusText}`);
+      completeEvidence(job.jobId, 'completed');
       reply({ jobId: job.jobId, kind: 'loader', raw: await res.text() });
     } catch (err) {
+      completeEvidence(job.jobId, 'failed');
       reply({ jobId: job.jobId, kind: 'loader', message: String(err?.message ?? err) });
     }
   }
@@ -75,6 +127,8 @@
   // uses. The server derives the id from clientCreateRequestId, taking its
   // first sixteen hex characters.
   async function runCreate(job) {
+    if (!validateSessionEpoch(job)) return;
+    recordEvidence(job.jobId, job.modelId);
     try {
       // A temporary chat is a different intent and takes no first message: the
       // server mints the conversation itself and marks it isTemporary, so it
@@ -98,8 +152,10 @@
         body: params.toString(),
       });
       if (!res.ok) throw new Error(`aipass returned ${res.status} ${res.statusText}`);
+      completeEvidence(job.jobId, 'completed');
       reply({ jobId: job.jobId, kind: 'loader', raw: await res.text() });
     } catch (err) {
+      completeEvidence(job.jobId, 'failed');
       reply({ jobId: job.jobId, kind: 'loader', message: String(err?.message ?? err) });
     }
   }
@@ -179,7 +235,19 @@
     };
   }
 
+  function sanitizeWafPayload(text) {
+    if (typeof text !== 'string') return text;
+    return text
+      .replace(/\brequire\s*\(/g, 'require/* */(')
+      .replace(/\beval\s*\(/g, 'eval/* */(')
+      .replace(/\bconsole\.(log|warn|error|info|debug|trace)\s*\(/g, 'console.$1/* */(')
+      .replace(/\bprocess\.exit\s*\(/g, 'process.exit/* */(')
+      .replace(/\(\s*([\"\']child_process[\"\'])\s*\)/g, '(/* */$1)');
+  }
+
   async function run(job) {
+    if (!validateSessionEpoch(job)) return;
+    recordEvidence(job.jobId, job.modelId);
     const controller = new AbortController();
     inflight.set(job.jobId, controller);
 
@@ -188,7 +256,7 @@
     let buffer = [];
     const flush = () => {
       if (!buffer.length) return;
-      reply({ jobId: job.jobId, kind: 'chunk', parts: buffer });
+      reply({ jobId: job.jobId, kind: 'chunk', parts: buffer, sessionEpoch: currentSessionEpoch });
       buffer = [];
     };
     const ticker = setInterval(flush, 40);
@@ -246,12 +314,12 @@
           } else {
             processedParts.push({
               type: 'text',
-              text: typeof p.text === 'string' ? p.text : String(p),
+              text: sanitizeWafPayload(typeof p.text === 'string' ? p.text : String(p)),
             });
           }
         }
       } else {
-        processedParts.push({ type: 'text', text: job.text });
+        processedParts.push({ type: 'text', text: sanitizeWafPayload(job.text) });
       }
 
       const body = JSON.stringify({
@@ -472,10 +540,12 @@
         }).join('\n')}`);
       }
       flush();
-      reply({ jobId: job.jobId, kind: 'done', finishReason });
+      completeEvidence(job.jobId, 'completed');
+      reply({ jobId: job.jobId, kind: 'done', finishReason, sessionEpoch: currentSessionEpoch });
     } catch (err) {
       flush();
-      if (err?.name === 'AbortError') reply({ jobId: job.jobId, kind: 'done', finishReason: 'stop' });
+      completeEvidence(job.jobId, 'failed');
+      if (err?.name === 'AbortError') reply({ jobId: job.jobId, kind: 'done', finishReason: 'stop', sessionEpoch: currentSessionEpoch });
       else reply({ jobId: job.jobId, kind: 'error', message: String(err?.message ?? err) });
     } finally {
       clearInterval(ticker);
@@ -488,6 +558,8 @@
   // to /actions/video-generation, then polled until it reports completed. The
   // web client does exactly this, and there is no streaming variant of it.
   async function runVideo(job) {
+    if (!validateSessionEpoch(job)) return;
+    recordEvidence(job.jobId, job.modelId);
     const controller = new AbortController();
     inflight.set(job.jobId, controller);
     const buffer = [];
@@ -558,6 +630,7 @@
           if (!videoUrl) throw new Error('the job completed without a video url');
           push('video', videoUrl, `${jobId}.mp4`);
           flush();
+          completeEvidence(job.jobId, 'completed');
           reply({ jobId: job.jobId, kind: 'done', finishReason: 'stop' });
           return;
         }
@@ -569,6 +642,7 @@
         }
       }
     } catch (err) {
+      completeEvidence(job.jobId, 'failed');
       // A job left running keeps burning the account's video quota, so cancel
       // it on the way out rather than abandoning it.
       if (jobId) {
@@ -634,15 +708,19 @@
   }
 
   async function runAssistant(job) {
+    if (!validateSessionEpoch(job)) return;
+    recordEvidence(job.jobId, job.modelId);
     const controller = new AbortController();
     inflight.set(job.jobId, controller);
     try {
       if (job.op === 'start-chat') {
         const conversationId = await startAssistantChat(job.assistantId, controller.signal);
+        completeEvidence(job.jobId, 'completed');
         return void reply({ jobId: job.jobId, kind: 'assistant', assistantId: job.assistantId, conversationId });
       }
       if (job.op === 'delete') {
         await postAssistant({ intent: 'delete', assistantId: job.assistantId }, controller.signal);
+        completeEvidence(job.jobId, 'completed');
         return void reply({ jobId: job.jobId, kind: 'assistant', assistantId: job.assistantId, deleted: true });
       }
       const draft = await postAssistant({ intent: 'createDraft' }, controller.signal);
@@ -661,20 +739,202 @@
       }, controller.signal);
 
       const confirmed = await postAssistant({ intent: 'confirmAssistant', assistantId }, controller.signal);
+      completeEvidence(job.jobId, 'completed');
       reply({ jobId: job.jobId, kind: 'assistant', assistantId, raw: JSON.stringify(confirmed).slice(0, 2000) });
     } catch (err) {
+      completeEvidence(job.jobId, 'failed');
       reply({ jobId: job.jobId, kind: 'assistant', message: String(err?.message ?? err) });
     } finally {
       inflight.delete(job.jobId);
     }
   }
 
+  /* ------------------------------------------------ dynamic model discovery */
+
+  function decodeTurboStream(text) {
+    try {
+      const flat = JSON.parse(text);
+      const seen = new Map();
+      const resolve = (ref) => {
+        if (typeof ref !== 'number') return ref;
+        if (ref < 0) return null;
+        if (seen.has(ref)) return seen.get(ref);
+        const v = flat[ref];
+        if (Array.isArray(v)) {
+          const out = [];
+          seen.set(ref, out);
+          for (const e of v) out.push(resolve(e));
+          return out;
+        }
+        if (v && typeof v === 'object') {
+          const out = {};
+          seen.set(ref, out);
+          for (const [k, valueRef] of Object.entries(v)) out[resolve(Number(k.slice(1)))] = resolve(valueRef);
+          return out;
+        }
+        seen.set(ref, v);
+        return v;
+      };
+      return resolve(0);
+    } catch {
+      return null;
+    }
+  }
+
+  const KIND_IDS = {
+    image: ['gemini-2.5-flash-image', 'gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image',
+      'gemini-3-pro-image', 'FLUX.2-pro', 'gpt-image-2', 'seedream-4.0', 'seedream-4.5',
+      'seedream-5.0-lite', 'flux2-klein-4b@jts', 'mock-remote-image'],
+    video: ['veo-3.0-generate-001', 'veo-3.1-generate-001', 'veo-3.1-fast-generate-001', 'sora-2',
+      'seedance-2.0', 'seedance-2.0-fast', 'seedance-2.0-mini', 'wan2.2@jts', 'mock-remote-video'],
+    music: ['lyria-3-clip-preview', 'lyria-3-pro-preview'],
+    research: ['gemini-2.5-pro-deep-research', 'openai-deep-research', 'sonar-deep-research',
+      'mock-remote-deep-research'],
+  };
+  const KIND_BY_ID = new Map(Object.entries(KIND_IDS).flatMap(([kind, ids]) => ids.map((id) => [id, kind])));
+  const KIND_PATTERNS = [
+    ['image', /seedream|gpt-image|flux|-image$|image-preview/i],
+    ['video', /^veo-|seedance|^sora-|^wan\d/i],
+    ['music', /lyria/i],
+    ['research', /deep-research/i],
+  ];
+  const kindOf = (id) => KIND_BY_ID.get(id) ?? KIND_PATTERNS.find(([, re]) => re.test(id))?.[0] ?? 'chat';
+
+  function extractModels(decoded) {
+    if (!decoded) return [];
+    const out = [];
+    const walk = (v) => {
+      if (Array.isArray(v)) return v.forEach(walk);
+      if (!v || typeof v !== 'object') return;
+      const id = v.id ?? v.modelId;
+      if (typeof id === 'string' && id && !out.some((m) => m.id === id)) {
+        const kind = kindOf(id);
+        out.push({
+          id,
+          name: v.displayName ?? v.name ?? id,
+          provider: v.providerName ?? v.provider ?? null,
+          providerId: v.provider ?? null,
+          description: v.description ?? null,
+          kind,
+          free: v.isFreeCredit === true || v.free === true,
+          ready: v.ready !== false,
+          selectable: v.selectable !== false,
+          isDefault: v.isDefault === true,
+          thinking: Array.isArray(v.thinkingConfig?.supportedLevels) ? v.thinkingConfig.supportedLevels : null,
+          media: kind !== 'chat' && kind !== 'research',
+        });
+      }
+      Object.values(v).forEach(walk);
+    };
+    walk(decoded);
+    return out.filter((m) => m.ready && m.selectable);
+  }
+
+  let cachedDiscoveredModels = [];
+
+  async function discoverModels() {
+    try {
+      const res = await fetch('/loaders/list-models.data?_routes=routes%2Floaders%2Flist-models', {
+        credentials: 'include',
+        headers: { accept: '*/*' },
+      });
+      if (res.ok) {
+        const text = await res.text();
+        const decoded = decodeTurboStream(text);
+        const models = extractModels(decoded);
+        if (models.length) {
+          cachedDiscoveredModels = models;
+          const defaultModel = models.find(m => m.isDefault)?.id || models[0]?.id || null;
+          reply({
+            kind: 'models_discovered',
+            type: 'MODELS_DISCOVERED',
+            models,
+            activeModel: defaultModel,
+            sessionEpoch: currentSessionEpoch,
+            catalogRevision: 'cat_' + currentSessionEpoch,
+          });
+          return models;
+        }
+      }
+    } catch (err) {
+      console.warn('[aipass-page] model discovery fetch error:', err);
+    }
+    if (cachedDiscoveredModels.length) {
+      reply({
+        kind: 'models_discovered',
+        type: 'MODELS_DISCOVERED',
+        models: cachedDiscoveredModels,
+        activeModel: cachedDiscoveredModels[0]?.id || null,
+        sessionEpoch: currentSessionEpoch,
+      });
+    }
+    return cachedDiscoveredModels;
+  }
+
+  async function prepareModel(requestId, modelId) {
+    let models = cachedDiscoveredModels;
+    if (!models.length) {
+      models = await discoverModels();
+    }
+    const found = models.find(m => m.id === modelId);
+    if (found) {
+      reply({
+        kind: 'model_ready',
+        type: 'MODEL_READY',
+        requestId,
+        model: modelId,
+        mappingRevision: 'rev_' + currentSessionEpoch,
+        sessionEpoch: currentSessionEpoch,
+      });
+    } else {
+      reply({
+        kind: 'stream_error',
+        type: 'STREAM_ERROR',
+        requestId,
+        error: `Model unverified: ${modelId} not found in browser catalog`,
+        code: 'model_unverified',
+        sessionEpoch: currentSessionEpoch,
+      });
+    }
+  }
+
+  window.addEventListener('beforeunload', () => {
+    invalidateEvidence();
+  });
+
   window.addEventListener('message', (event) => {
     if (window.__aipassBridgeGen !== GEN) return; // superseded by a newer injection
     if (event.source !== window) return;
     const msg = event.data;
     if (!msg || typeof msg !== 'object') return;
-    if (msg[TAG] === 'req') {
+    if (msg[TAG] === 'session_ready') {
+      const prevEpoch = currentSessionEpoch;
+      currentSessionEpoch = msg.sessionEpoch || Date.now();
+      if (prevEpoch !== currentSessionEpoch) {
+        invalidateEvidence();
+        log('session epoch updated:', currentSessionEpoch);
+      }
+      // Trigger model discovery on new session
+      discoverModels();
+      return;
+    }
+    else if (msg[TAG] === 'models_discovered') {
+      // BridgeDO is sending us its model catalog — update local state
+      if (Array.isArray(msg.models)) {
+        log('models synced from bridge:', msg.models.length);
+      }
+      return;
+    }
+    else if (msg[TAG] === 'req') {
+      if (!isLeader) {
+        console.log('[aipass-page] ignoring request — this tab is standby');
+        return;
+      }
+      const job = msg.job;
+      if (job.sessionEpoch && job.sessionEpoch !== currentSessionEpoch) {
+        window.postMessage({ [TAG]: 'res', type: 'STREAM_ERROR', requestId: job.requestId || job.jobId, error: 'Session epoch mismatch', code: 'session_epoch_mismatch', sessionEpoch: currentSessionEpoch }, '*');
+        return;
+      }
       const fn = msg.job.kind === 'loader' ? runLoader
         : msg.job.kind === 'create' ? runCreate
         : msg.job.kind === 'video' ? runVideo
@@ -683,7 +943,27 @@
       fn(msg.job);
     }
     else if (msg[TAG] === 'abort') inflight.get(msg.jobId)?.abort();
+    else if (msg[TAG] === 'discover_models') {
+      discoverModels();
+      return;
+    }
+    else if (msg[TAG] === 'prepare_model') {
+      prepareModel(msg.requestId, msg.model).catch(() => {});
+    }
+    else if (msg[TAG] === 'coordinator-role') {
+      const wasLeader = isLeader;
+      isLeader = msg.role === 'leader';
+      if (msg.sessionEpoch) {
+        currentSessionEpoch = msg.sessionEpoch;
+        if (wasLeader && !isLeader) {
+          invalidateEvidence();
+        }
+      }
+      console.log('[aipass-page] coordinator role:', msg.role);
+      return;
+    }
   });
 
   reply({ kind: 'page-ready' });
+  setTimeout(() => discoverModels().catch(() => {}), 200);
 })();

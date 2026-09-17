@@ -62,7 +62,7 @@
     [TAG]: 'res',
     sessionEpoch: currentSessionEpoch,
     ...msg,
-  }, window.location.origin);
+  }, '*');
 
   function validateSessionEpoch(job) {
     if (job?.sessionEpoch != null && job.sessionEpoch !== currentSessionEpoch) {

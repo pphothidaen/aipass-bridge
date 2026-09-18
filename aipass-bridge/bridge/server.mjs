@@ -9,24 +9,52 @@
 // for the web UI, so there is nothing to reconstruct on this side.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadConfig } from './config.mjs';
 
-const PORT = Number(process.env.AIPASS_PORT ?? 8787);
-const HOST = process.env.AIPASS_HOST ?? '127.0.0.1';
-const MODELS_FALLBACK = (process.env.AIPASS_MODELS ?? 'gemini-3.1-flash-lite,claude-sonnet-5@default')
-  .split(',').map((s) => s.trim()).filter(Boolean);
+// Config precedence (highest wins): Doppler → Cloudflare wrangler vars → .env
+// → defaults. See bridge/config.mjs and docs/CONFIGURATION.md.
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+const CFG = await loadConfig({
+  PORT: { env: 'AIPASS_PORT', type: 'number', default: 8787 },
+  HOST: { env: 'AIPASS_HOST', type: 'string', default: '127.0.0.1' },
+  STATEFUL_COORDINATOR: { env: 'AIPASS_STATEFUL_COORDINATOR', type: 'boolean', default: true },
+  MODELS: { env: 'AIPASS_MODELS', type: 'string', default: 'gemini-3.1-flash-lite,claude-sonnet-5@default' },
+  TOOL_VISIBILITY: { env: 'AIPASS_TOOL_VISIBILITY', type: 'string', default: 'reasoning' },
+  CONVERSATION_ID: { env: 'AIPASS_CONVERSATION_ID', type: 'string', default: '' },
+  IDLE_TIMEOUT_MS: { env: 'AIPASS_IDLE_TIMEOUT_MS', type: 'number', default: 180_000 },
+  MEDIA_TIMEOUT_MS: { env: 'AIPASS_MEDIA_TIMEOUT_MS', type: 'number', default: 900_000 },
+  KEEPALIVE_MS: { env: 'AIPASS_KEEPALIVE_MS', type: 'number', default: 15_000 },
+  MODEL: { env: 'AIPASS_MODEL', type: 'string', default: 'gemini-3.1-flash-lite' },
+  ASSISTANT_ID: { env: 'AIPASS_ASSISTANT_ID', type: 'string', default: '' },
+  ASSISTANT_FIELD: { env: 'AIPASS_ASSISTANT_FIELD', type: 'string', default: 'aiAssistantId' },
+  ASPECT_RATIO: { env: 'AIPASS_ASPECT_RATIO', type: 'string', default: '1:1' },
+  CORS_ORIGIN: { env: 'AIPASS_CORS_ORIGIN', type: 'string', default: '' },
+  ADMIN: { env: 'AIPASS_ADMIN', type: 'boolean', default: false },
+  ALLOWED_HOSTS: { env: 'AIPASS_ALLOWED_HOSTS', type: 'string', default: '' },
+}, { root: REPO_ROOT, dotenvPath: path.join(REPO_ROOT, 'packages/core/aipass-bridge/.env') });
+
+const PORT = CFG.PORT;
+const HOST = CFG.HOST;
+
+// Feature flag: when AIPASS_STATEFUL_COORDINATOR=0, falls back to legacy stateless relay
+// (no epoch fencing, no FIFO queue, no leader election). Default: enabled.
+const STATEFUL_COORDINATOR = CFG.STATEFUL_COORDINATOR !== false;
+const MODELS_FALLBACK = CFG.MODELS.split(',').map((s) => s.trim()).filter(Boolean);
 // Where upstream tool activity (web_search progress, sources) goes:
 // 'reasoning' -> delta.reasoning_content, 'text' -> inline, 'off' -> dropped.
-const TOOL_VISIBILITY = process.env.AIPASS_TOOL_VISIBILITY ?? 'reasoning';
-const PINNED_CONVERSATION = process.env.AIPASS_CONVERSATION_ID ?? '';
-const IDLE_TIMEOUT_MS = Number(process.env.AIPASS_IDLE_TIMEOUT_MS ?? 180_000);
+const TOOL_VISIBILITY = CFG.TOOL_VISIBILITY;
+const PINNED_CONVERSATION = CFG.CONVERSATION_ID;
+const IDLE_TIMEOUT_MS = CFG.IDLE_TIMEOUT_MS;
 // Rendering a video or a music clip can go quiet for minutes at a stretch. The
 // timeout is on silence, not on total time, but three minutes of it is normal
 // here and would kill a generation that was going to succeed — and the credits
 // are already spent by then.
-const MEDIA_TIMEOUT_MS = Number(process.env.AIPASS_MEDIA_TIMEOUT_MS ?? 900_000);
+const MEDIA_TIMEOUT_MS = CFG.MEDIA_TIMEOUT_MS;
 // How often a streaming response emits an SSE comment when it has nothing else
 // to say. Comfortably inside the 300s body timeout that Node's own fetch applies.
-const KEEPALIVE_MS = Number(process.env.AIPASS_KEEPALIVE_MS ?? 15_000);
+const KEEPALIVE_MS = CFG.KEEPALIVE_MS;
 // Attachments up to MAX_ATTACHMENT_BYTES travel Base64-inlined in a JSON
 // envelope, which costs a third again plus escaping — the client-facing cap has
 // to hold that whole envelope or the advertised 20 MB file is undeliverable.
@@ -36,15 +64,15 @@ const MAX_BODY = 32 * 1024 * 1024;
 // higher ceiling than client requests.
 const MAX_EXT_BODY = 128 * 1024 * 1024;
 
-let defaultModel = process.env.AIPASS_MODEL ?? 'gemini-3.1-flash-lite';
+let defaultModel = CFG.MODEL;
 // Bind newly created conversations to a custom aipass assistant. The form field
 // name is not yet confirmed from a capture, so it is configurable; the default
 // is the most likely candidate and is harmless if the server ignores it.
-let assistantId = process.env.AIPASS_ASSISTANT_ID ?? '';
+let assistantId = CFG.ASSISTANT_ID;
 // Only the image models read this; the chat models ignore it. The web UI offers
 // 1:1, 3:4 and 4:3, and a request may override the default per call.
-let aspectRatio = process.env.AIPASS_ASPECT_RATIO ?? '1:1';
-const ASSISTANT_FIELD = process.env.AIPASS_ASSISTANT_FIELD ?? 'aiAssistantId';
+let aspectRatio = CFG.ASPECT_RATIO;
+const ASSISTANT_FIELD = CFG.ASSISTANT_FIELD;
 
 // This bridge has no authentication, so it must not be reachable from arbitrary
 // web pages — anything that can talk to it can spend the account's credits.
@@ -53,11 +81,11 @@ const ASSISTANT_FIELD = process.env.AIPASS_ASSISTANT_FIELD ?? 'aiAssistantId';
 // extension reaches the bridge with host-permission privilege, so neither needs
 // it. Set AIPASS_CORS_ORIGIN only if you deliberately want a browser page to
 // call the bridge. Admin/deployment routes stay off unless AIPASS_ADMIN=1.
-const CORS_ORIGIN = process.env.AIPASS_CORS_ORIGIN ?? '';
-const ADMIN = process.env.AIPASS_ADMIN === '1';
+const CORS_ORIGIN = CFG.CORS_ORIGIN;
+const ADMIN = CFG.ADMIN === true;
 const ALLOWED_HOSTS = new Set([
   '127.0.0.1', 'localhost', '::1', '[::1]',
-  ...(process.env.AIPASS_ALLOWED_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+  ...CFG.ALLOWED_HOSTS.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
 ]);
 
 // A DNS-rebinding attacker points a name they control at 127.0.0.1 and has the
@@ -73,6 +101,15 @@ const corsHeaders = () => (CORS_ORIGIN
   : {});
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+
+// ─── Cloudflare 403 Detection ───────────────────────────────────────────────
+// Used by the circuit breaker to detect Cloudflare challenge/forbidden responses
+// that should pause the request queue rather than fail the request outright.
+function isCloudflare403(message) {
+  const text = String(message ?? '');
+  return /(?:aipass returned|returned) 403\b/i.test(text)
+    && /cloudflare|cf-ray|attention required/i.test(text);
+}
 
 /* ------------------------------------------------- react-router turbo-stream */
 
@@ -320,6 +357,14 @@ const pickClient = () => {
 };
 
 const sendToClient = (client, event, data) =>
+  client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+import { BridgeDO } from './bridge-do.mjs';
+import { ProtocolV2, validateMessage, validateEpochEnvelope, validateMessageSequence } from './protocol-v2.mjs';
+const bridgeDO = new BridgeDO();
+const bridgeClients = new Set();
+const bridgeSeqTracker = new Map(); // epoch → last seq
+const sendToBridgeClient = (client, event, data) =>
   client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
 class Job {
@@ -609,6 +654,41 @@ function startChat({ modelId, text, parts, aspectRatio: ratio, thinkingLevel, vi
 
   attempt();
   return { abort: () => current?.abort() };
+}
+
+// Protocol v2 execution path. The legacy Job flow remains available for older
+// extension clients, while a connected v2 client gets strict model/session
+// admission and structured stream parts from BridgeDO.
+function startBridgeChat({ modelId, text, parts, aspectRatio: ratio, thinkingLevel, video, imageStyleId, outputTone, outputFormat, onDelta, onDone, onError }) {
+  let cancelled = false;
+  void (async () => {
+    try {
+      const conversationId = await resolveConversation();
+      if (cancelled) return;
+      const finishReason = await bridgeDO.executeJob({
+        kind: kindOf(modelId) === 'video' ? 'video' : 'chat',
+        modelId,
+        text,
+        parts,
+        conversationId,
+        aspectRatio: ratio,
+        thinkingLevel,
+        video,
+        imageStyleId,
+        outputTone,
+        outputFormat,
+        temporary: conversationIsTemporary,
+      }, (part) => {
+        if (!cancelled) onDelta(part);
+      });
+      if (!cancelled) onDone(finishReason);
+    } catch (err) {
+      if (!cancelled) onError(err?.message ?? String(err));
+    }
+  })();
+  return {
+    abort: () => { cancelled = true; },
+  };
 }
 
 // True for loopback, link-local and RFC1918 addresses. The URL parser has
@@ -987,6 +1067,38 @@ async function chatCompletions(req, res) {
   const { text, parts } = await extractUserParts(payload.messages);
   if (!text && (!parts || parts.length === 0)) return oaiError(res, 400, 'no user message');
 
+  // Fail-fast: extension must be connected
+  if (!pickClient() && !bridgeDO.isExtensionReady()) {
+    return oaiError(res, 503, 'No browser extension connected — open a de.aipass.net tab and check the popup', 'service_unavailable');
+  }
+
+  // Protocol v2 is active only when stateful coordinator is enabled AND a v2 bridge client is connected.
+  // Legacy extension clients (via /ext/events) always use the legacy Job flow.
+  const useProtocolV2 = STATEFUL_COORDINATOR && bridgeDO.isExtensionReady();
+
+  // Strict model verification (only when protocol v2 is active)
+  if (useProtocolV2) {
+    const catalogEntry = bridgeDO.dynamicModels.find((entry) => entry.id === model);
+    if (!catalogEntry || catalogEntry.ready === false || catalogEntry.selectable === false) {
+      return oaiError(res, 422, `Model unverified: ${model}`, 'model_unverified');
+    }
+  }
+
+  // FIFO queue gate — only when a protocol v2 bridge client is connected.
+  // Legacy extension clients (via /ext/events) bypass the queue entirely.
+  if (STATEFUL_COORDINATOR && bridgeDO.isExtensionReady()) {
+    // Cloudflare 403 Circuit Breaker: block new requests when circuit is open
+    const circuit = bridgeDO.isCircuitBlocked();
+    if (circuit.blocked) {
+      return oaiError(res, 503, `Cloudflare 403 circuit open — retry in ${Math.ceil(circuit.remainingMs / 1000)}s`, 'circuit_open');
+    }
+    try {
+      await bridgeDO.enqueueRequest();
+    } catch (queueErr) {
+      if (queueErr.code === 'queue_full') return oaiError(res, 429, 'Request queue is full (max 10), try again later', 'rate_limit');
+      return oaiError(res, 503, String(queueErr.message), 'service_unavailable');
+    }
+  }
   const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
   const imageCount = (parts ?? []).filter(p => p.type === 'image').length;
@@ -1018,7 +1130,8 @@ async function chatCompletions(req, res) {
     };
     emit({ role: 'assistant', content: '' });
 
-    const job = startChat({
+    const start = useProtocolV2 ? startBridgeChat : startChat;
+    const job = start({
       modelId: model, text, parts, aspectRatio: ratio, thinkingLevel, video,
       imageStyleId, outputTone, outputFormat,
       onDelta: (part) => {
@@ -1033,12 +1146,18 @@ async function chatCompletions(req, res) {
         else emit({ content: part.text });
       },
       onDone: (finishReason) => {
+        if (STATEFUL_COORDINATOR && bridgeDO.isExtensionReady()) {
+          bridgeDO.dequeueRequest();
+          // Record success — resets circuit breaker if it was open
+          bridgeDO.recordSuccess();
+        }
         stopKeepalive();
         emit({}, finishReason === 'length' ? 'length' : 'stop');
         res.write('data: [DONE]\n\n');
         res.end();
       },
       onError: (message) => {
+        if (STATEFUL_COORDINATOR && bridgeDO.isExtensionReady()) bridgeDO.dequeueRequest();
         stopKeepalive();
         res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error' } })}\n\n`);
         res.write('data: [DONE]\n\n');
@@ -1052,7 +1171,8 @@ async function chatCompletions(req, res) {
   let out = '';
   let reasoning = '';
   await new Promise((resolve) => {
-    const job = startChat({
+    const start = useProtocolV2 ? startBridgeChat : startChat;
+    const job = start({
       modelId: model, text, parts, aspectRatio: ratio, thinkingLevel, video,
       imageStyleId, outputTone, outputFormat,
       onDelta: (p) => {
@@ -1062,6 +1182,10 @@ async function chatCompletions(req, res) {
         else out += p.text;
       },
       onDone: (finishReason) => {
+        if (STATEFUL_COORDINATOR && bridgeDO.isExtensionReady()) {
+          bridgeDO.dequeueRequest();
+          bridgeDO.recordSuccess();
+        }
         json(res, 200, {
           id, object: 'chat.completion', created, model,
           choices: [{
@@ -1079,10 +1203,125 @@ async function chatCompletions(req, res) {
         });
         resolve();
       },
-      onError: (message) => { oaiError(res, 502, message, 'upstream_error'); resolve(); },
+      onError: (message) => { if (STATEFUL_COORDINATOR && bridgeDO.isExtensionReady()) bridgeDO.dequeueRequest(); oaiError(res, 502, message, 'upstream_error'); resolve(); },
     });
     res.on('close', () => { job.abort(); resolve(); });
   });
+}
+
+/* -------------------------------------------------------- bridge channel */
+
+function bridgeChannel(req, res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    ...corsHeaders(),
+  });
+  const client = { id: randomUUID(), write: (data) => res.write(data), closed: false, res };
+  bridgeDO.addClient(client);
+  bridgeClients.add(client);
+  log(`bridge connected (${bridgeClients.size} total)`);
+  
+  const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
+  ping.unref?.();
+  req.on('close', () => {
+    clearInterval(ping);
+    client.closed = true;
+    bridgeDO.removeClient(client);
+    bridgeClients.delete(client);
+    log(`bridge disconnected (${bridgeClients.size} left)`);
+    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
+  });
+}
+
+async function bridgeMessage(req, res) {
+  try {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const msg = JSON.parse(body);
+
+    const validation = validateMessage(msg.type, msg);
+    if (!validation.ok) return oaiError(res, 400, validation.error, 'invalid_request_error');
+
+    // Epoch fencing: reject stale sessions and out-of-order messages
+    if (msg.sessionEpoch != null && msg.sessionEpoch !== bridgeDO.sessionEpoch) {
+      return oaiError(res, 409, 'stale protocol session', 'session_epoch_mismatch');
+    }
+
+    // Fencing token check (monotonic sequence) — only when stateful coordinator is active
+    if (STATEFUL_COORDINATOR) {
+      const epochCheck = validateEpochEnvelope(msg, bridgeDO.sessionEpoch);
+      if (!epochCheck.ok) return oaiError(res, 400, epochCheck.error, 'fencing_error');
+      if (!validateMessageSequence(msg, bridgeSeqTracker)) {
+        return oaiError(res, 400, 'out-of-order message sequence', 'sequence_error');
+      }
+    }
+
+    switch (msg.type) {
+      case 'MODELS_DISCOVERED':
+        bridgeDO.replaceModelCatalog(msg);
+        log(`bridge: models discovered (${bridgeDO.dynamicModels.length})`);
+        break;
+      case 'STREAM_CHUNK':
+      case 'STREAM_DONE':
+      case 'STREAM_ERROR':
+      case 'MODEL_READY': {
+        const handler = bridgeDO.activeStreams.get(msg.requestId);
+        if (handler) {
+          if (msg.type === 'STREAM_CHUNK') handler({
+            type: ProtocolV2.STREAM_CHUNK,
+            chunk: msg.chunk,
+            parts: msg.parts,
+            sessionEpoch: msg.sessionEpoch,
+          });
+          if (msg.type === 'STREAM_DONE') handler({
+            type: ProtocolV2.STREAM_DONE,
+            finishReason: msg.finishReason,
+            sessionEpoch: msg.sessionEpoch,
+          });
+          if (msg.type === 'STREAM_ERROR') {
+            // Cloudflare 403 Circuit Breaker: detect and pause queue
+            const errorText = msg.error ?? msg.message ?? '';
+            if (isCloudflare403(errorText)) {
+              bridgeDO.handleCloudflare403(msg.requestId);
+            }
+            handler({
+              type: ProtocolV2.STREAM_ERROR,
+              error: errorText,
+              code: msg.code,
+              sessionEpoch: msg.sessionEpoch,
+            });
+          }
+          if (msg.type === 'MODEL_READY') handler({
+            type: ProtocolV2.MODEL_READY,
+            model: msg.model,
+            mappingRevision: msg.mappingRevision,
+            sessionEpoch: msg.sessionEpoch,
+          });
+        }
+        break;
+      }
+      case 'PONG':
+        bridgeDO.lastPong = Date.now();
+        break;
+      case 'SESSION_READY':
+        bridgeDO.currentTokens = msg.tokens;
+        if (msg.sessionEpoch != null && msg.sessionEpoch !== bridgeDO.sessionEpoch) {
+          bridgeDO.sessionEpoch = msg.sessionEpoch;
+          bridgeDO.invalidateAllEvidence();
+        }
+        if (typeof msg.protocolVersion === 'number') bridgeDO.protocolVersion = msg.protocolVersion;
+        break;
+      case 'MODEL_UPDATED':
+        bridgeDO.activeBrowserModel = msg.activeModel ?? msg.model ?? null;
+        bridgeDO.extendedThinkingActive = msg.extendedThinking === true || msg.extendedThinkingActive === true;
+        break;
+    }
+    return json(res, 200, { ok: true });
+  } catch (err) {
+    return oaiError(res, 400, err.message, 'invalid_request_error');
+  }
 }
 
 /* -------------------------------------------------------- extension channel */
@@ -1108,6 +1347,7 @@ function extEvents(req, res) {
   warm(() => refreshStyleOptions(), 1700);
 
   const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
+  ping.unref?.();
   req.on('close', () => {
     clearInterval(ping);
     extClients.delete(client);
@@ -1183,12 +1423,15 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/v1/models') {
       const all = await listModels({ force: url.searchParams.get('refresh') === '1' });
+      const dynamic = bridgeDO.dynamicModels;
+      const merged = dynamic.length > 0 ? [...dynamic, ...all.filter(m => !dynamic.find(d => d.id === m.id))] : all;
       // ?kind=image (or a comma-separated set) narrows the list the way the web
       // UI's tabs do.
       const want = (url.searchParams.get('kind') ?? '').split(',').map((k) => k.trim()).filter(Boolean);
-      const models = want.length ? all.filter((m) => want.includes(m.kind)) : all;
+      const models = want.length ? merged.filter((m) => want.includes(m.kind)) : merged;
       return json(res, 200, {
         object: 'list',
+        catalogRevision: bridgeDO.catalogRevision,
         data: models.map((m) => ({
           id: m.id, object: 'model', created: 0, owned_by: m.provider ?? 'aipass',
           name: m.name, free_credit: m.free, thinking: m.thinking,
@@ -1400,11 +1643,33 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, message: 'reloading extension' });
       }
 
+      if (path === '/circuit-breaker/reset' && req.method === 'POST') {
+        bridgeDO.resetCircuitBreaker();
+        return json(res, 200, { ok: true, message: 'circuit breaker reset' });
+      }
+
+      if (path === '/circuit-breaker/status' && req.method === 'GET') {
+        const cb = bridgeDO.circuitBreaker;
+        const blocked = bridgeDO.isCircuitBlocked();
+        return json(res, 200, {
+          isOpen: cb.isOpen,
+          blocked: blocked.blocked,
+          remainingMs: blocked.remainingMs,
+          failureCount: cb.failureCount,
+          lastFailureAt: cb.lastFailureAt,
+          resumeAt: cb.resumeAt,
+          totalPaused: cb.totalPaused,
+        });
+      }
+
       if (path === '/tab/reload' && req.method === 'POST') {
         for (const client of extClients) sendToClient(client, 'reload_tab', {});
         return json(res, 200, { ok: true, message: 'reloading tab' });
       }
     }
+
+    if (path === '/bridge' && req.method === 'GET') return bridgeChannel(req, res);
+    if ((path === '/bridge/msg' || path === '/bridge/message') && req.method === 'POST') return bridgeMessage(req, res);
 
     if (path === '/ext/events' && req.method === 'GET') return extEvents(req, res);
     if (path === '/ext/chunk' && req.method === 'POST') return await extPost(req, res, 'chunk');
@@ -1414,10 +1679,21 @@ const server = http.createServer(async (req, res) => {
     if (path === '/ext/assistant' && req.method === 'POST') return await extPost(req, res, 'assistant');
 
     if (path === '/status' || path === '/health') {
+      const circuitStatus = bridgeDO.isCircuitBlocked();
       return json(res, 200, {
         ok: true,
         extensions: extClients.size,
         activeJobs: jobs.size,
+        bridgeReady: bridgeDO.isExtensionReady(),
+        bridgeQueue: { busy: bridgeDO.requestBusy, pending: bridgeDO.pendingRequests.length },
+        bridgeModels: bridgeDO.dynamicModels.length,
+        circuitBreaker: {
+          isOpen: bridgeDO.circuitBreaker.isOpen,
+          blocked: circuitStatus.blocked,
+          remainingMs: circuitStatus.remainingMs,
+          failureCount: bridgeDO.circuitBreaker.failureCount,
+          totalPaused: bridgeDO.circuitBreaker.totalPaused,
+        },
         defaultModel,
         conversation: PINNED_CONVERSATION || conversationCache,
         temporary: conversationIsTemporary,

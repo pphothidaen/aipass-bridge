@@ -10,12 +10,14 @@ function parseInstructions(text) {
   const prose = [];
   const instructions = [];
   let i = 0;
+  let foundInstruction = false;
 
   while (i < lines.length) {
     const line = lines[i];
 
     let m = /^\s*NEED\s+(dir|file)\s+(.+?)\s*$/i.exec(line);
     if (m) {
+      foundInstruction = true;
       i++;
       instructions.push({ kind: m[1].toLowerCase() === 'dir' ? 'list' : 'read', arg: m[2].trim() });
       continue;
@@ -23,6 +25,7 @@ function parseInstructions(text) {
 
     m = /^\s*SEARCH\s+(.+?)\s*$/i.exec(line);
     if (m) {
+      foundInstruction = true;
       i++;
       instructions.push({ kind: 'search', arg: m[1].trim() });
       continue;
@@ -30,6 +33,7 @@ function parseInstructions(text) {
 
     m = /^\s*EDIT\s+(.+?)\s*$/i.exec(line);
     if (m) {
+      foundInstruction = true;
       i++;
       while (i < lines.length && !/^\s*FIND\s*$/i.test(lines[i])) i++;
       if (i < lines.length) i++;
@@ -45,6 +49,7 @@ function parseInstructions(text) {
 
     m = /^\s*CREATE\s+(.+?)\s*$/i.exec(line);
     if (m) {
+      foundInstruction = true;
       i++;
       const body = [];
       while (i < lines.length && !/^\s*END\s*$/i.test(lines[i])) body.push(lines[i++]);
@@ -54,6 +59,7 @@ function parseInstructions(text) {
     }
 
     if (/^\s*RUN\s*$/i.test(line)) {
+      foundInstruction = true;
       i++;
       const body = [];
       while (i < lines.length && !/^\s*END\s*$/i.test(lines[i])) body.push(lines[i++]);
@@ -64,8 +70,15 @@ function parseInstructions(text) {
 
     m = /^\s*DONE\b\s*(.*)$/i.exec(line);
     if (m) {
+      foundInstruction = true;
       i++;
       instructions.push({ kind: 'done', arg: m[1].trim() });
+      continue;
+    }
+
+    // If we found any instruction, stop collecting prose from subsequent lines
+    if (foundInstruction) {
+      i++;
       continue;
     }
 

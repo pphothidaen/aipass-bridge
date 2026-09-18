@@ -56,3 +56,4 @@ aipass*.md
 /aipass-*.jpg
 /aipass-*.webp
 
+.aipass-models.json

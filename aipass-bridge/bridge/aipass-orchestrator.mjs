@@ -129,8 +129,8 @@ async function orchestrate(payload) {
       const candidates = [];
       // Prefer files closer to the project root (home/Projects/project/)
       const commonRoots = [
-        resolve(homedir(), 'Project', 'aipass-dev-suite'),
-        resolve(homedir(), 'Projects', 'aipass-dev-suite'),
+        resolve(homedir(), 'Project', 'aipass-web-bridge'),
+        resolve(homedir(), 'Projects', 'aipass-web-bridge'),
       ];
       for (const root of commonRoots) {
         candidates.push(resolve(root, bareFile));

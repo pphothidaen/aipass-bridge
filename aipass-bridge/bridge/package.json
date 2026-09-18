@@ -1,11 +1,12 @@
 {
   "name": "aipass-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "OpenAI-compatible local endpoint backed by de.aipass.net via a Chrome extension.",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "mcp-agent": "node mcp-agent.mjs"
   },
   "engines": {
     "node": ">=18"

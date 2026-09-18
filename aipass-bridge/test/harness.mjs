@@ -49,7 +49,7 @@ export async function startBridge(env = {}) {
     port,
     log,
     logText: () => log.join(''),
-    stop() { child.kill('SIGKILL'); },
+    stop() { child.kill('SIGKILL'); child.unref?.(); },
   };
 }
 
@@ -251,12 +251,35 @@ export class FakeExtension {
     return this;
   }
 
+  async connectBridge() {
+    this.bridgeController = new AbortController();
+    const res = await fetch(`${this.base}/bridge`, { signal: this.bridgeController.signal });
+    this.bridgeReading = this.#readBridge(res.body.getReader());
+    await waitFor(async () => (await (await fetch(`${this.base}/status`).then(r => r.json()).catch(() => ({})))).bridgeReady === true);
+    return this;
+  }
+
   async disconnect() {
     if (this.gone) return;   // t.after also calls this after an explicit disconnect
     this.gone = true;
-    const before = await this.count();
-    this.controller?.abort();
-    await waitFor(async () => (await this.count()) < before, { timeout: 2000 }).catch(() => {});
+    if (this.controller) {
+      const before = await this.count();
+      this.controller.abort();
+      await waitFor(async () => (await this.count()) < before, { timeout: 2000 }).catch(() => {});
+    }
+    if (this.bridgeController) {
+      this.bridgeController.abort();
+      await waitFor(async () => !(await fetch(`${this.base}/status`).then(r => r.json()).catch(() => ({}))).bridgeReady, { timeout: 2000 }).catch(() => {});
+    }
+  }
+
+  async #readBridge(reader) {
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch { /* aborted */ }
   }
 
   async #read(reader) {

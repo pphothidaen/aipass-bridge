@@ -106,6 +106,21 @@ Built on Node with no runtime dependencies, plus an MV3 Chrome extension.
 The bridge has no authentication of its own — keep it on `127.0.0.1`. Anything
 that can reach the port can spend the account's credits.
 
+## VS Code project context
+
+The VS Code extension can add a versioned, filtered project context to a user
+message. Identity and memory are default-deny sections:
+
+- `aipass.context.coding` — active file language and bounded content (default on)
+- `aipass.context.projects` — workspace name and root (default on)
+- `aipass.context.identity` — optional user identity (default off)
+- `aipass.context.memory` — reserved for a future local memory provider (default off)
+
+Context is sent as part of the newest user message rather than as a system
+message because the upstream browser endpoint accepts only that message.
+Context access metadata is recorded locally as JSONL under the extension's
+global storage; prompt contents are not recorded.
+
 **If you cloned or forked before 2 Sep 2026, update.** Copies taken before
 [`8cad676`](https://github.com/niawjunior/aipass-bridge/commit/8cad676) have a
 bridge that any website you visited could drive. See [SECURITY.md](SECURITY.md).

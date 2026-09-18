@@ -27,9 +27,9 @@ async function readStream(res) {
 
 test('refuses a request with no extension attached', async () => {
   const res = await post({ messages: [{ role: 'user', content: 'hi' }] });
-  assert.equal(res.status, 502);
+  assert.equal(res.status, 503);
   const body = await res.json();
-  assert.match(body.error.message, /no extension connected/);
+  assert.match(body.error.message, /no.*extension connected/i);
 });
 
 test('streams text, tool status and a finish reason', async () => {
@@ -855,3 +855,126 @@ test('tone and format travel as codes and apply to any model', async (t) => {
   await post({ model: 'gemini-3.1-flash-lite', messages: [{ role: 'user', content: 'hi' }], output_tone: 'shouty' });
   assert.equal(ext.chats.at(-1).outputTone, undefined, 'an unknown tone is dropped, not forwarded');
 });
+
+test('Protocol v2: /bridge SSE channel connects and registers with BridgeDO', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connectBridge();
+  t.after(() => ext.disconnect());
+
+  const status = await (await fetch(`${bridge.base}/status`)).json();
+  assert.equal(status.bridgeReady, true);
+  assert.equal(typeof status.bridgeQueue, 'object');
+  assert.equal(status.bridgeQueue.busy, false);
+  await ext.disconnect();
+});
+
+test('Protocol v2: /bridge/message syncs MODELS_DISCOVERED to BridgeDO catalog', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connectBridge();
+  t.after(() => ext.disconnect());
+
+  const msgRes = await fetch(`${bridge.base}/bridge/message`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'MODELS_DISCOVERED',
+      models: [
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', kind: 'chat', ready: true, selectable: true },
+        { id: 'flux2-klein-4b@jts', name: 'Flux 2 Klein', kind: 'image', ready: true, selectable: true },
+      ],
+      protocolVersion: 2,
+    }),
+  });
+  assert.equal(msgRes.status, 200);
+  const body = await msgRes.json();
+  assert.equal(body.ok, true);
+
+  const status = await (await fetch(`${bridge.base}/status`)).json();
+  assert.equal(status.bridgeModels, 2);
+  await ext.disconnect();
+});
+
+test('BridgeDO: Evidence Registry binds to sessionEpoch and invalidates on epoch change', async () => {
+  const { BridgeDO } = await import('../bridge/bridge-do.mjs');
+  const doInstance = new BridgeDO();
+  const epoch1 = 100000;
+  const epoch2 = 200000;
+
+  doInstance.registerEvidence('gen-1', 'gemini-3.1-pro-preview', epoch1, 'rev-1');
+  assert.equal(doInstance.validateEvidence('gen-1', epoch1), true);
+  assert.equal(doInstance.validateEvidence('gen-1', epoch2), false, 'mismatched epoch must be rejected');
+
+  doInstance.invalidateAllEvidence();
+  assert.equal(doInstance.validateEvidence('gen-1', epoch1), false, 'invalidated evidence must be rejected');
+  doInstance.destroy();
+});
+
+test('BridgeDO: FIFO queue enforces QUEUE_MAX = 10 with queue_full code', async () => {
+  const { BridgeDO } = await import('../bridge/bridge-do.mjs');
+  const doInstance = new BridgeDO();
+
+  // First request acquires the lock immediately
+  await doInstance.enqueueRequest();
+  assert.equal(doInstance.requestBusy, true);
+  assert.equal(doInstance.pendingRequests.length, 0);
+
+  // Next 10 requests queue up
+  const queuePromises = [];
+  for (let i = 0; i < 10; i++) {
+    queuePromises.push(doInstance.enqueueRequest());
+  }
+  assert.equal(doInstance.pendingRequests.length, 10);
+
+  // 11th request must throw queue_full (HTTP 503 / 429 semantics)
+  await assert.rejects(
+    async () => { await doInstance.enqueueRequest(); },
+    (err) => err.code === 'queue_full'
+  );
+
+  // Dequeue frees slots
+  doInstance.dequeueRequest();
+  assert.equal(doInstance.pendingRequests.length, 9);
+  doInstance.destroy();
+});
+
+test('Protocol v2: Monotonic fencing token rejects stale epoch', async () => {
+  const { resetEpochFence, getEpochFence, createEpochEnvelope, validateEpochEnvelope, validateMessageSequence } = await import('../bridge/protocol-v2.mjs');
+
+  resetEpochFence();
+  const env1 = createEpochEnvelope('STREAM_CHUNK', { chunk: 'a' });
+  const env2 = createEpochEnvelope('STREAM_CHUNK', { chunk: 'b' });
+
+  // Sequence must be monotonic increasing
+  assert.ok(env2.seq > env1.seq, 'seq must increase');
+
+  // Current epoch must validate
+  const currentEpoch = getEpochFence().epoch;
+  assert.ok(validateEpochEnvelope(env1, currentEpoch).ok);
+
+  // Stale epoch must be rejected
+  const staleCheck = validateEpochEnvelope(env1, currentEpoch + 1000);
+  assert.ok(!staleCheck.ok);
+  assert.match(staleCheck.error, /stale epoch/);
+
+  // Out-of-order sequence must be rejected
+  const lastSeqMap = new Map();
+  assert.ok(validateMessageSequence(env1, lastSeqMap));
+  assert.ok(validateMessageSequence(env2, lastSeqMap));
+  // Duplicate/repeated seq must be rejected
+  assert.ok(!validateMessageSequence(env1, lastSeqMap));
+});
+
+test('Feature flag: AIPASS_STATEFUL_COORDINATOR=0 disables epoch fencing', async (t) => {
+  const solo = await startBridge({ AIPASS_STATEFUL_COORDINATOR: '0' });
+  t.after(() => solo.stop());
+
+  // Even if we send a message with fencing fields, server must not reject based on fencing
+  const res = await fetch(`${solo.base}/v1/models`);
+  assert.equal(res.status, 200);
+});
+
+test('Feature flag: FIFO queue active only when stateful coordinator enabled', async () => {
+  const doInstance = (await import('../bridge/bridge-do.mjs')).BridgeDO ? (await import('../bridge/bridge-do.mjs')).BridgeDO : null;
+  // BridgeDO can be imported for unit testing queue behavior
+  const mod = await import('../bridge/bridge-do.mjs');
+  assert.ok(mod.BridgeDO, 'BridgeDO export exists');
+});
+

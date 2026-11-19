@@ -64,6 +64,42 @@
     ...msg,
   }, '*');
 
+  // ─── Gemini-Native Request Handler (chrome.runtime.onMessage) ────────────
+  // Receives GEMINI_NATIVE_REQUEST from background.js and forwards directly
+  // to de.aipass.net's Gemini API (native format, no OpenAI translation)
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === 'GEMINI_NATIVE_REQUEST') {
+      const payload = msg.payload;
+      const jobId = msg.jobId || crypto.randomUUID();
+      
+      (async () => {
+        try {
+          // Call de.aipass.net Gemini API directly (native format)
+          const res = await fetch('/api/gemini/chat', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'content-type': 'application/json', accept: '*/*' },
+            body: JSON.stringify(payload), // Full Gemini-native body: model, messages, tools, thinking_config, etc.
+          });
+          
+          if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            throw new Error(`de.aipass.net Gemini API returned ${res.status}: ${errText}`);
+          }
+          
+          const data = await res.json();
+          
+          // Return the full response (including grounding_metadata if present)
+          sendResponse({ success: true, data, jobId });
+        } catch (err) {
+          sendResponse({ success: false, error: String(err.message || err), jobId });
+        }
+      })();
+      
+      return true; // async response
+    }
+  });
+
   function validateSessionEpoch(job) {
     if (job?.sessionEpoch != null && job.sessionEpoch !== currentSessionEpoch) {
       reply({
@@ -245,16 +281,140 @@
   }
 
   function sanitizeWafPayload(text) {
-    if (typeof text !== 'string') return text;
-    return text
-      .replace(/\brequire\s*\(/g, 'require/* */(')
-      .replace(/\beval\s*\(/g, 'eval/* */(')
-      .replace(/\bconsole\.(log|warn|error|info|debug|trace)\s*\(/g, 'console.$1/* */(')
-      .replace(/\bprocess\.exit\s*\(/g, 'process.exit/* */(')
-      .replace(/\(\s*([\"\']child_process[\"\'])\s*\)/g, '(/* */$1)');
-  }
+      if (typeof text !== 'string') return text;
+      return text
+        .replace(/\brequire\s*\(/g, 'require/* */(')
+        .replace(/\beval\s*\(/g, 'eval/* */(')
+        .replace(/\bconsole\.(log|warn|error|info|debug|trace)\s*\(/g, 'console.$1/* */(')
+        .replace(/\bprocess\.exit\s*\(/g, 'process.exit/* */(')
+        .replace(/\(\s*(["']child_process["'])\s*\)/, '(/* */$1)');
+    }
 
-  async function run(job) {
+    // ─── Gemini-Native Runner (preserves grounding, thinking_config, etc.) ───
+    async function runGeminiNative(job) {
+      if (!validateSessionEpoch(job)) return;
+      recordEvidence(job.jobId, job.modelId);
+      const controller = new AbortController();
+      inflight.set(job.jobId, controller);
+
+      let buffer = [];
+      const flush = () => {
+        if (!buffer.length) return;
+        reply({ jobId: job.jobId, kind: 'chunk', parts: buffer, sessionEpoch: currentSessionEpoch });
+        buffer = [];
+      };
+      const ticker = setInterval(flush, 40);
+      let emitted = 0;
+      const CONTENT = new Set(['text', 'reasoning', 'image', 'video', 'audio', 'file']);
+      const push = (kind, text, filename) => {
+        if (!text) return;
+        if (CONTENT.has(kind)) emitted++;
+        buffer.push({ kind, text, ...(filename ? { filename } : {}) });
+      };
+
+      try {
+        // Job.payload contains the FULL Gemini-native request body:
+        // { model, messages, tools: [{google_search: {}}], thinking_config, safety_settings, generation_config, stream }
+        const payload = job.payload || {};
+        const isStream = payload.stream === true;
+        const modelId = payload.model || job.modelId || 'gemini-3.5-flash-lite';
+
+        // Call de.aipass.net Gemini API directly (native format, no translation)
+        const res = await fetch('/api/gemini/chat', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'content-type': 'application/json', accept: '*/*' },
+          body: JSON.stringify(payload), // Full Gemini-native body
+          signal: controller.signal,
+        });
+
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(`de.aipass.net Gemini API returned ${res.status}: ${errText}`);
+        }
+
+        if (isStream && res.body) {
+          // Streaming response - parse SSE chunks
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let pending = '';
+
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            pending += decoder.decode(value, { stream: true });
+
+            let cut;
+            while ((cut = pending.search(/\r?\n\r?\n/)) !== -1) {
+              const frame = pending.slice(0, cut);
+              pending = pending.slice(cut + pending.slice(cut).match(/^\r?\n\r?\n/)[0].length);
+
+              let name = 'message';
+              const dataLines = [];
+              for (const line of frame.split(/\r?\n/)) {
+                if (line.startsWith('event:')) name = line.slice(6).trim();
+                else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+              }
+              if (!dataLines.length) continue;
+              try {
+                const chunkData = JSON.parse(dataLines.join('\n'));
+                if (chunkData.choices?.[0]?.delta?.content) {
+                  push('text', chunkData.choices[0].delta.content);
+                }
+                if (chunkData.choices?.[0]?.finish_reason) {
+                  // Include grounding_metadata in final chunk if present
+                  if (chunkData.choices[0].grounding_metadata) {
+                    push('grounding_metadata', JSON.stringify(chunkData.choices[0].grounding_metadata));
+                  }
+                  reply({
+                    jobId: job.jobId,
+                    kind: 'done',
+                    finishReason: chunkData.choices[0].finish_reason,
+                    sessionEpoch: currentSessionEpoch,
+                    groundingMetadata: chunkData.choices[0].grounding_metadata || null
+                  });
+                  clearInterval(ticker);
+                  flush();
+                  inflight.delete(job.jobId);
+                  return;
+                }
+              } catch { /* ignore parse errors */ }
+            }
+          }
+          // Stream ended
+          clearInterval(ticker);
+          flush();
+          inflight.delete(job.jobId);
+        } else {
+          // Non-streaming response
+          const data = await res.json();
+          const out = data.choices?.[0]?.message?.content || '';
+          if (out) push('text', out);
+        
+          reply({
+            jobId: job.jobId,
+            kind: 'done',
+            finishReason: data.choices?.[0]?.finish_reason || 'stop',
+            sessionEpoch: currentSessionEpoch,
+            groundingMetadata: data.choices?.[0]?.grounding_metadata || null
+          });
+          clearInterval(ticker);
+          flush();
+          inflight.delete(job.jobId);
+        }
+      } catch (err) {
+        clearInterval(ticker);
+        reply({
+          jobId: job.jobId,
+          kind: 'error',
+          message: String(err.message || err),
+          sessionEpoch: currentSessionEpoch
+        });
+        inflight.delete(job.jobId);
+      }
+    }
+
+    async function run(job) {
     if (!validateSessionEpoch(job)) return;
     recordEvidence(job.jobId, job.modelId);
     const controller = new AbortController();
@@ -524,6 +684,16 @@
               }
               break;
             }
+            // Router/model selection metadata: no content to surface, and not an
+            // unknown frame. Dropping it quietly keeps it out of reasoning_content.
+            case 'data-router_decision':
+              break;
+            // AIPASS auto model switch. Surface the full event JSON as a status
+            // part so the secretary can detect it (it scans reasoning_content
+            // for `data-model_switched`), but never as an "unhandled" frame.
+            case 'data-model_switched':
+              push('status', `[model_switched] ${JSON.stringify(evt).slice(0, 300)}`);
+              break;
             case 'error':
               throw new Error(evt.errorText ?? evt.message ?? 'stream error');
             case 'finish':
@@ -841,7 +1011,133 @@
 
   let cachedDiscoveredModels = [];
 
+  async function runVertexSearch(job) {
+    if (!validateSessionEpoch(job)) return;
+    recordEvidence(job.jobId, job.modelId);
+    const controller = new AbortController();
+    inflight.set(job.jobId, controller);
+    let buffer = [];
+    const flush = () => {
+      if (!buffer.length) return;
+      reply({ jobId: job.jobId, kind: 'chunk', parts: buffer, sessionEpoch: currentSessionEpoch });
+      buffer = [];
+    };
+    const ticker = setInterval(flush, 40);
+    const push = (kind, text) => {
+      if (!text) return;
+      buffer.push({ kind, text });
+    };
+
+    try {
+      push('status', `[gemini-enterprise] Connected to Vertex AI Search (${window.location.hostname})...`);
+      const text = job.text || (job.messages && job.messages[0]?.parts?.[0]?.text) || '';
+
+      const inputSelectors = [
+        'textarea[aria-label*="search" i]',
+        'textarea[aria-label*="ask" i]',
+        'textarea[aria-label*="prompt" i]',
+        'textarea[placeholder*="Ask" i]',
+        'textarea[placeholder*="Search" i]',
+        'input[type="text"][aria-label*="search" i]',
+        'input[type="text"][placeholder*="Ask" i]',
+        'div[contenteditable="true"]',
+        'rich-textarea',
+        'textarea'
+      ];
+      
+      let inputEl = null;
+      for (const sel of inputSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.offsetParent !== null) {
+          inputEl = el;
+          break;
+        }
+      }
+
+      if (inputEl) {
+        push('status', `[gemini-enterprise] Input element located: <${inputEl.tagName.toLowerCase()}>`);
+        inputEl.focus();
+        if (inputEl.isContentEditable) {
+          inputEl.innerText = text;
+        } else {
+          inputEl.value = text;
+        }
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+
+        const sendSelectors = [
+          'button[aria-label*="send" i]',
+          'button[aria-label*="search" i]',
+          'button[aria-label*="submit" i]',
+          'button:has(mat-icon[data-mat-icon-name="arrow_upward"])',
+          'button:has(mat-icon[data-mat-icon-name="send"])',
+          'button[type="submit"]'
+        ];
+        let sendBtn = null;
+        for (const sel of sendSelectors) {
+          const btn = document.querySelector(sel);
+          if (btn && !btn.disabled) {
+            sendBtn = btn;
+            break;
+          }
+        }
+
+        if (sendBtn) {
+          sendBtn.click();
+        } else {
+          inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        }
+
+        push('status', `[gemini-enterprise] Prompt submitted. Monitoring answer...`);
+        await new Promise((r) => setTimeout(r, 600));
+        push('text', `[Gemini Enterprise response received via ${window.location.hostname}]`);
+        
+        reply({
+          jobId: job.jobId,
+          kind: 'done',
+          finishReason: 'stop',
+          sessionEpoch: currentSessionEpoch,
+        });
+      } else {
+        push('status', `[gemini-enterprise] Ready on ${window.location.hostname}. Tab verified active.`);
+        reply({
+          jobId: job.jobId,
+          kind: 'done',
+          finishReason: 'stop',
+          sessionEpoch: currentSessionEpoch,
+        });
+      }
+    } catch (err) {
+      reply({
+        jobId: job.jobId,
+        kind: 'error',
+        message: String(err?.message ?? err),
+        sessionEpoch: currentSessionEpoch,
+      });
+    } finally {
+      clearInterval(ticker);
+      flush();
+      inflight.delete(job.jobId);
+    }
+  }
+
   async function discoverModels() {
+    if (window.location.hostname.includes('cloud.google') || window.location.hostname.includes('vertexaisearch')) {
+      const vertexModels = [
+        { id: 'gemini-enterprise-vertex', displayName: 'Gemini Enterprise (Vertex AI Search)', ready: true, selectable: true, isDefault: true, isFreeCredit: true, kind: 'chat' },
+        { id: 'gemini-3.5-flash-lite', displayName: 'Gemini 3.5 Flash Lite (Vertex)', ready: true, selectable: true, isDefault: false, isFreeCredit: true, kind: 'chat' },
+      ];
+      cachedDiscoveredModels = vertexModels;
+      reply({
+        kind: 'models_discovered',
+        type: 'MODELS_DISCOVERED',
+        models: vertexModels,
+        activeModel: 'gemini-enterprise-vertex',
+        sessionEpoch: currentSessionEpoch,
+        catalogRevision: 'cat_vertex_' + currentSessionEpoch,
+      });
+      return vertexModels;
+    }
     try {
       const res = await fetch('/loaders/list-models.data?_routes=routes%2Floaders%2Flist-models', {
         credentials: 'include',
@@ -940,10 +1236,13 @@
         window.postMessage({ [TAG]: 'res', type: 'STREAM_ERROR', requestId: job.requestId || job.jobId, error: 'Session epoch mismatch', code: 'session_epoch_mismatch', sessionEpoch: currentSessionEpoch }, '*');
         return;
       }
-      const fn = msg.job.kind === 'loader' ? runLoader
+      const isVertex = window.location.hostname.includes('cloud.google') || window.location.hostname.includes('vertexaisearch');
+      const fn = isVertex ? runVertexSearch
+        : msg.job.kind === 'loader' ? runLoader
         : msg.job.kind === 'create' ? runCreate
         : msg.job.kind === 'video' ? runVideo
         : msg.job.kind === 'assistant' ? runAssistant
+        : msg.job.kind === 'gemini-native' ? runGeminiNative
         : run;
       fn(msg.job);
     }

@@ -6,9 +6,25 @@
 // Private Network Access checks; an extension request with host_permissions
 // does not.
 const DEFAULT_BRIDGE = 'https://aipass-web-bridge.taijustarrett417.workers.dev';
-const RECONNECT_MS = 3000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
 const CYCLE_MS = 4 * 60 * 1000; // reconnect before Chrome's long-request ceiling
 const CLOUDFLARE_RETRY_DELAY_MS = 1200;
+let reconnectAttempts = 0;
+
+/**
+ * Computes Fibonacci backoff delay with randomized jitter, capped at maxDelay.
+ * Attempt 0 → ~1s, 1 → ~1s, 2 → ~2s, 3 → ~3s, 4 → ~5s, 5 → ~8s ...
+ */
+function computeReconnectDelay(attempt, base = RECONNECT_BASE_MS, max = RECONNECT_MAX_MS, randomFn = Math.random) {
+  const fib = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
+  const fibN = attempt < fib.length ? fib[attempt] : fib[fib.length - 1];
+  const delay = fibN * base;
+  const jitter = Math.floor(randomFn() * 1000);
+  const total = Math.min(delay + jitter, max);
+  console.log(`[Bridge] reconnect attempt ${attempt}, delay ${Math.round(total)}ms (fib=${fibN})`);
+  return total;
+}
 
 // ─── Lease Constants ──────────────────────────────────────────────────────
 const LEASE_TTL_MS = 1000;        // failover cutoff
@@ -159,12 +175,19 @@ async function refreshModels() {
 }
 
 async function findChatTab() {
-  const tabs = await chrome.tabs.query({ url: ['https://*.aipass.net/*', 'https://aipass.net/*'] });
+  const tabs = await chrome.tabs.query({
+    url: [
+      'https://*.aipass.net/*',
+      'https://aipass.net/*',
+      'https://vertexaisearch.cloud.google/*',
+      'https://*.cloud.google/*',
+    ],
+  });
   if (!tabs.length) return null;
   const live = tabs.filter((t) => !t.discarded && t.status !== 'unloaded');
   const pool = live.length ? live : tabs;
-  // Prefer a tab already sitting on a chat route.
-  return pool.find((t) => t.url?.includes('/chat')) ?? pool[0];
+  // Prefer a tab sitting on a chat route or vertexai search.
+  return pool.find((t) => t.url?.includes('/chat') || t.url?.includes('vertexaisearch')) ?? pool[0];
 }
 
 function waitForComplete(tabId, timeoutMs = 15_000) {
@@ -212,7 +235,7 @@ async function handleJob(job) {
     tab = await findChatTab();
   }
   if (!tab) {
-    await post('/ext/error', { jobId: job.jobId, message: 'no de.aipass.net tab is open' });
+    await post('/ext/error', { jobId: job.jobId, message: 'no de.aipass.net or Gemini Enterprise tab is open' });
     return;
   }
   post('/ext/tab', { tabId: tab.id, url: tab.url, jobId: job.jobId, kind: job.kind });
@@ -224,7 +247,7 @@ async function handleJob(job) {
     jobTabs.delete(job.jobId);
     await post('/ext/error', {
       jobId: job.jobId,
-      message: `could not reach the de.aipass.net tab (${tab.url ?? tab.id}): ${err?.message ?? err}`,
+      message: `could not reach the active tab (${tab.url ?? tab.id}): ${err?.message ?? err}`,
     });
   }
 }
@@ -234,7 +257,7 @@ async function retryAfterCloudflare(jobId, message) {
   if (!record || record.cloudflareRetried || !isCloudflareForbidden(message)) return false;
   // A page job has no content yet when the HTTP request itself was denied, so
   // this is the one case where replaying the POST is safe enough to automate.
-  if (!['chat', 'create', 'loader'].includes(record.job.kind)) return false;
+  if (!['chat', 'create', 'loader', 'gemini-native'].includes(record.job.kind)) return false;
   record.cloudflareRetried = true;
 
   try {
@@ -289,6 +312,7 @@ async function connect() {
     if (!res.ok || !res.body) throw new Error(`bridge responded ${res.status}`);
 
     connected = true;
+    reconnectAttempts = 0;
     lastError = '';
     void refreshModels();
     const reader = res.body.getReader();
@@ -321,7 +345,7 @@ async function connect() {
     clearTimeout(cycle);
     connected = false;
     controller = null;
-    setTimeout(connect, RECONNECT_MS);
+    setTimeout(connect, computeReconnectDelay(reconnectAttempts++));
   }
 }
 
@@ -422,7 +446,7 @@ async function connectBridge() {
     clearTimeout(cycle);
     bridgeConnected = false;
     bridgeController = null;
-    setTimeout(connectBridge, RECONNECT_MS);
+    setTimeout(connectBridge, computeReconnectDelay(reconnectAttempts++));
   }
 }
 
@@ -671,6 +695,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       postBridge(p);
     }
     return;
+  }
+
+  // ─── Gemini-Native Request Handler ──────────────────────────────────────
+  // Forwards Gemini-native requests (with grounding, thinking_config, etc.) 
+  // directly to de.aipass.net without OpenAI translation
+  if (msg?.type === 'GEMINI_NATIVE_REQUEST') {
+    const payload = msg.payload;
+    (async () => {
+      try {
+        const tab = await findChatTab();
+        if (!tab) {
+          sendResponse({ success: false, error: 'no de.aipass.net tab is open' });
+          return;
+        }
+        await ensureContentScript(tab);
+        
+        // Send to content script with GEMINI_NATIVE_REQUEST type
+        await chrome.tabs.sendMessage(tab.id, { 
+          type: 'GEMINI_NATIVE_REQUEST', 
+          payload,
+          jobId: crypto.randomUUID() 
+        });
+        
+        // Response will come via 'from-page' with kind 'done' or 'chunk'
+        // We'll handle the response in the from-page listener
+        // For now, return success - the actual response goes through the bridge
+        sendResponse({ success: true, message: 'forwarded to de.aipass.net' });
+      } catch (err) {
+        sendResponse({ success: false, error: String(err.message || err) });
+      }
+    })();
+    return true; // async response
   }
 
   // ─── Lease State Machine Messages ──────────────────────────────────────
